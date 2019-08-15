@@ -1,0 +1,189 @@
+
+"""
+This program evaluates the performance of a chosen tensor decomposition 
+algorithm on simulated data. It works as follows. 
+1. The user specifies the algorithm to be tested and a few input parameters. 
+2. 16 tensor types are generated, from easy to difficult. 
+3. nruns random tensors of each tensor type are generated. The algorithm is 
+applied to each of these nruns tensors. For each run, the error upon convergence 
+and convergence time is stored. Summary statistics are also computed. 
+Inputs
+------
+1. rank: the rank of the tensor decomposition
+2. nruns: the number of random tensors of each type to generate for testing
+3. algo: the name of the algorithm to be tested. See the relevant function for 
+details
+4. l1: the level of homoscedastic noise in the simulated tensor
+5. l2: the level of heteroscedastic noise in the simulated tensor
+Output
+------
+1. tensor_params: a table containing: (i) the parameters of each tensor type
+in cols 1:5; (ii) summary stats on algorithm performance in cols 6:9 (mean 
+error upon convergence, std dev of these errors, mean convergence time, and the 
+std dev of these times); (iii) the errors upon convergence of the nruns runs in 
+cos 10:(10+nruns); and (iv) the convergence times in cols (11+nruns):(11+2*nruns)
+"""
+
+import numpy as np
+import tensorly as tl
+import pandas as pd
+from decomp import *
+from datasets import *
+import argparse
+
+# Set input parameters:
+rank=3 # Rank of the decomposition 
+nruns=3 # The number of runs for each tensor type
+algo=ALS_Nesterov_S1 # The algorithm name (defined in earlier function)
+file_name = "ALS_Nesterov_S1.csv" # Set the name of file containing results as the algorithm name
+l1 = 1 # Set level of homoscedastic noise in tensor
+l2 = 0 # Set level of heteroscedastic noise in tensor
+
+# Flag whether tensor contains noise:
+if l1>0 or l2>0:
+    noise = True
+else:
+    noise = False
+
+# Set the tensor format depending on which algorithm is being run:
+if algo==ALS_Nesterov_bisection_ls or algo==ALS_Nesterov_backtracking_ls:
+    torch_tensor=True
+else:
+    torch_tensor=False
+
+# Create a table containing the tensor parameters. Col 1 = true rank of tensor; 
+# col 2 = size of each dimension; col 3 = amount of collinearity in the factors 
+# of each mode; cols 4 and 5 = noise levels. Let the table have 2*nruns empty 
+# columns to store the algorithm's error upon convergence and convergence time 
+# for each run on each tensor. Also let the table have 4 emtpy columns to store 
+# summary statistics: mean and std errors upon convergence and convergence times. 
+    
+tensor_params = np.zeros((16, 6+2*nruns+4))
+tensor_params[:,0:6] = np.array([[3, 20, 0.5, l1, l2,nruns], # Rank 3, moderate collinearity
+                          [3, 50, 0.5, l1, l2,nruns],
+                          [3, 100, 0.5, l1, l2,nruns], 
+                          [3, 250, 0.5, l1, l2,nruns],
+                          [5, 20, 0.5, l1, l2,nruns], # Rank 5, moderate collinearity
+                          [5, 50, 0.5, l1, l2,nruns],
+                          [5, 100, 0.5, l1, l2,nruns], 
+                          [5, 250, 0.5, l1, l2,nruns],
+                          [3, 20, 0.9, l1, l2,nruns], # Rank 3, high collinearity
+                          [3, 50, 0.9, l1, l2,nruns],
+                          [3, 100, 0.9, l1, l2,nruns], 
+                          [3, 250, 0.9, l1, l2,nruns],
+                          [5, 20, 0.9, l1, l2,nruns], # Rank 5, high collinearity
+                          [5, 50, 0.9, l1, l2,nruns],
+                          [5, 100, 0.9, l1, l2,nruns], 
+                          [5, 250, 0.9, l1, l2,nruns]])
+    
+# A tensor type is defined by each row of the tensor_params table. The following 
+# loop takes a tensor type, generates nruns random tensors of that type, 
+# applies the selected algorithm to each of the nruns tensors, computes the 
+# error upon convergence and convergence time for each run, computes average 
+# performance across the nruns for each tensor type, and stores output in table.
+    
+# Outer loop iterates through the tensor types (rows) in tensor_params table:
+for i in (range(len(tensor_params[:,1]))):
+    print("===> Running experiments for tensor ", i)
+    
+    # Set parameters:
+    R = tensor_params[i,0].astype(int)
+    I = tensor_params[i,1].astype(int)
+    collinearity = tensor_params[i,2]
+    l1 = tensor_params[i,3]
+    l2 = tensor_params[i,4]
+    
+    # To store output:
+    final_errors = []
+    converge_times = []
+    
+    # For the given tensor type, simulate nruns tensors and apply the algorithm to each one:
+    for rep in (range(nruns)):
+        print("  run", rep)
+        
+        # Generate the random tensors (both noiseless and noisy):
+        Z, Zprime, Zdprime, U = simulate_tensors(random_seed=rep, I=I, collinearity=collinearity, R=R, l1=l1, l2=l2, bottleneck=0, torch_tensor=torch_tensor)
+
+        # Set tensor as noiseless or noisy depending on params set above:
+        if noise==False:
+            tensor=Z
+        elif noise==True:
+            tensor=Zdprime
+
+        # Apply the chosen algorithm:
+        elapsed_time, errors, curr_factors, iter_times = algo(tensor=tensor, rank=R, n_iter_max=100, random_state=rep, tol=10e-6)
+
+        # Set correct tensorly backend depending on the tensor format:
+        if torch_tensor==False:
+            tl.set_backend('numpy')
+        elif torch_tensor==True:
+            tl.set_backend('pytorch')
+        
+        # Extract error upon convergence and convergence time:
+        final_error = errors[-1]
+        converge_time = elapsed_time
+    
+        # If the tensor is noisy, we need to compute the error upon convergence 
+        # as the norm of the difference between the noiseless tensor and the 
+        # approximation obtained. (Otherwise we will be measuring how closely 
+        # the approximation matches the noisy tensor):
+        if noise==True:
+            final_error = tl.norm(tensor - tl.kruskal_to_tensor(curr_factors))
+    
+        final_errors.append(final_error)
+        converge_times.append(converge_time)
+     
+    # Produce summary stats:
+    mean_final_error = np.mean(final_errors)
+    std_final_errors = np.std(final_errors)
+    mean_converge_time = np.mean(converge_times)
+    std_converge_times = np.std(converge_times)
+    
+    # Put summary stats in table next to correspinding params:
+    tensor_params[i,6] = mean_final_error
+    tensor_params[i,7] = std_final_errors
+    tensor_params[i,8] = mean_converge_time
+    tensor_params[i,9] = std_converge_times
+    
+    # Store the error upon convergence and convergence times for every run on 
+    # every tensor:
+    tensor_params[i,10:(10+nruns)] = final_errors
+    tensor_params[i,(10+nruns):(10+2*nruns)] = converge_times
+
+
+"""
+The code below puts the results generated above into a Pandas dataframe to 
+simplify data analysis.
+"""
+
+# Create row labels (tensor types):
+tensor_type = list(range(17))[1:17]
+
+# Create column labels:
+params = list(['R','I','C','l1','l2','nruns']) # Tensor parameters and number of runs
+summary_stats = list(['mean_final_error','std_final_errors','mean_converge_time','std_converge_times']) # Summary stats from running alg
+runs = list(range(nruns+1))[1:nruns+1] # Run numbers
+final_errors = [str(col) + '_err' for col in runs] # Add _err to each run number to indicate final error for that run
+converge_times = [str(col) + '_time' for col in runs] # Add _time to each run number to indicate convergence time
+col_names = params + summary_stats + final_errors + converge_times # Combine above labels into column labels
+
+# Create the results table:
+results = pd.DataFrame(tensor_params, index=tensor_type, columns=col_names)
+
+# Save results to csv file (file_name is the algorithm):
+results.to_csv(file_name)
+
+# Read in file:
+pd.read_csv(file_name)
+
+# Some examples of data processing:
+results.loc[:,['R']] # Extract the ranks from column R
+results.loc['1':'4'] # Extract all results for first 4 tensors
+results.loc['1':'4',['R','I']] # Extract ranks and sizes for first 4 tensor types
+results[results['I'].isin(['20','50'])] # Extract all results for tensors with I in (20,50)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Dummy')
+    parser.add_argument('---filename', type=str, help='output filename')
+    args = parser.parse_args()
+    print(args.filename)
