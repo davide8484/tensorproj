@@ -1,0 +1,268 @@
+"""
+The functions below load the real tensors. 
+"""
+
+# Import required packages:
+import numpy as np
+import tensorly as tl
+import scipy.io
+from datasets import *
+
+
+
+def load_claus(torch_tensor):
+    
+    """
+    This function loads the claus tensor. 
+    
+    Inputs
+    ------
+    1. torch_tensor: set to True to give a torch tensor (line search decomp 
+    function requires a torch tensor). Otherwise set to False (non line search 
+    decomp function requires this).
+    
+    Outputs
+    ------
+    1. The claus tensor.
+    
+    """
+
+    mat = scipy.io.loadmat('datasets/claus.mat', squeeze_me=True)
+    
+    if torch_tensor==False:
+        claus = mat['X']
+    elif torch_tensor==True:
+        claus = torch.from_numpy(mat['X'])
+            
+    return claus
+
+
+def load_enron(torch_tensor):
+    
+    """
+    This function loads the enron tensor. 
+    
+    Inputs
+    ------
+    1. torch_tensor: set to True to give a torch tensor (line search decomp 
+    function requires a torch tensor). Otherwise set to False (non line search 
+    decomp function requires this).
+    
+    Outputs
+    ------
+    1. The enron tensor.
+    
+    """
+
+    mat = scipy.io.loadmat('datasets/new_enron.mat', squeeze_me=True)
+    
+    if torch_tensor==False:
+        enron = mat['new_enron']
+    elif torch_tensor==True:
+        enron = torch.from_numpy(mat['new_enron'])
+            
+    return enron
+
+
+def load_gas3(torch_tensor):
+    
+    """
+    This function loads the gas3 tensor. Note that before running this 
+    function to load the data, the gas3 tensor needs to be downloaded from 
+    the following link and saved to your working director as 'gas3data.mat':
+    https://www.kaggle.com/davidevans8484/gas3-tensor
+    Inputs
+    ------
+    1. torch_tensor: set to True to give a torch tensor (line search decomp 
+    function requires a torch tensor). Otherwise set to False (non line search 
+    decomp function requires this).
+    
+    Outputs
+    ------
+    1. The gas3 tensor.
+    
+    """
+
+    mat = scipy.io.loadmat('gas3data.mat', squeeze_me=True)
+    
+    if torch_tensor==False:
+        gas3 = mat['gas3_data']
+    elif torch_tensor==True:
+        gas3 = torch.from_numpy(mat['gas3_data'])
+            
+    return gas3
+
+
+"""
+The load_swamp and load_bottleneck functions below load simulated three-way
+cubic swamp and bottleneck tensors respectively. This is done by setting the 
+collinearity at 0.9 for the factors in (a) all three modes for the swamp and 
+(b) two of the three modes for the bottleneck. 
+The user can specify the size and rank of the tensors. Typical values are rank 
+R=3,5 and size I=20,50,100,250 (for a tensor of size I x I x I). The user can 
+also specify the seed used in the initialisation of the random true factor 
+matrices, allowing the generation of many random tensors of the same type. 
+Finally, the user can specify whether to generate the tensor as a numpy array 
+or torch tensor: the decomp function takes a numpy array and the decomp_ls function
+takes a torch tensor.
+To control the amount of collinearity and add noise to the tensors, use the 
+simulate_tensors function below. 
+"""
+
+# Example call to load swamp:
+#import numpy as np
+#import tensorly as tl
+#swamp = load_swamp(I=20,R=3, random_seed=1, torch_tensor=False) # Gives a tensor of size IxIxI with true rank 3
+
+
+def load_swamp(I,R,random_seed, torch_tensor):
+    
+    """
+    This function generates a tensor with swamping (collinear factors in all 
+    modes).
+    
+    Inputs
+    ------
+    1. I: the size of the tensor is I x I x I.
+    2. R: the true rank of the tensor.
+    3. random_seed: the random seed used for the initialisation of the factor 
+    matrices.
+    4. torch_tensor: set as False to generate a numpy array (for input into 
+    decomp function); set to True to generate a torch tensor (for input into 
+    decomp_ls function)
+    
+    Outputs
+    ------
+    1. Z: the tensor.
+    """
+    
+    Z, Zprime, Zdprime, U = simulate_tensors(random_seed=random_seed, I=I, collinearity=0.9, R=R, l1=0, l2=0, bottleneck=0, torch_tensor=torch_tensor)
+    return Z
+
+
+def load_bottleneck(I,R,random_seed, torch_tensor):
+    
+    """
+    This function generates a tensor with a bottleneck: specifically, it has 
+    collinear factors in two modes (out of three). 
+    
+    Inputs
+    ------
+    1. I: the size of the tensor is I x I x I.
+    2. R: the true rank of the tensor.
+    3. random_seed: the random seed used for the initialisation of the factor 
+    matrices.
+    4. torch_tensor: set as False to generate a numpy array (for input into 
+    decomp function); set to True to generate a torch tensor (for input into 
+    decomp_ls function)
+    
+    Outputs
+    ------
+    1. Z: the tensor.
+    
+    """
+    
+    Z, Zprime, Zdprime, U = simulate_tensors(random_seed=random_seed, I=I, collinearity=0.9, R=R, l1=0, l2=0, bottleneck=2, torch_tensor=torch_tensor)
+    return Z
+
+
+
+
+# Example call to generate: swamp tensor (Z), swamp tensor with homoscedastic noise (Zprime), swamp
+# tensor with heteroscedastic noise (Zdprime), and the true factor matrices (U):
+#Z, Zprime, Zdprime, U = simulate_tensors(random_seed=1, I=250, collinearity=0.9, R=3, l1=1, l2=1, bottleneck=False, torch_tensor=True)
+
+
+# Function:
+def simulate_tensors(random_seed, I, collinearity, R, l1, l2, bottleneck, torch_tensor):
+    
+    """
+    This function is based on the method used in Tomasi and Bro (2006) to simulate 
+    cubic tensors with varying degrees of ill-conditioning. It can produce both
+    'bottleneck' scenarios (where two or more factors in one mode are collinear) 
+    and 'swamp' scenarios (where there is a bottleneck in each mode). Note that 
+    the bottlenecks and swamps that this function generates involve all factors 
+    in a given mode being collinear. 
+    Inputs:
+        1. random_seed: used for reproducibility of the tensors.
+        2. I: the size of each tensor is IxIxI.
+        3. collinearity: the amount of collinearity between the factors of each 
+        mode. Set at 0.9 or greater for swamps/bottlenecks.
+        4. R: the true rank of the tensor.
+        5. l1: the level of homoscedastic noise.
+        6. l2: the level of heteroscedastic noise.
+        7. bottleneck: set at 0 for a swamp (collinear factors in all 3 modes); 
+        set at 1 or 2 for a bottleneck (collinear factors in 1 or 2 modes 
+        respectively).
+        8. torch_tensor: set as False to generate a numpy array (for input into 
+        decomp function); set to True to generate a torch tensor (for input into 
+        decomp_ls function)
+    Output:
+        1. Z: the simulated tensor with true rank R, size IxIxI, and some specified 
+        level of collinearity between the factors of each mode.
+        2. Zprime: Z, potentially with some level l1 of homoscedastic noise added.
+        3. Zdprime: Zprime, potentially with some level l2 of heteroscedastic 
+        noise added
+        4. U: the true factor matrices.
+    """
+    tl.set_backend('numpy')
+    np.random.seed(random_seed) 
+    
+    # First generate K:
+    K = collinearity*np.ones((R,R))+(1-collinearity)*np.identity(R)
+    
+    # Get C as Cholesky factor of K (transpose returns upper triangle matrix):
+    C = np.transpose(np.linalg.cholesky(K))
+    
+    U = np.empty([3, I, R]) # Create empty array to store factor matrices
+    
+    # Generate the factor matrices:
+    for n in range(0,3):
+        M = np.random.normal(0,1,[I,R]) # Generate a random matrix
+        Q = np.linalg.qr(M)[0] # Ortho-normalize the columns of M to give Q
+        U[n] = np.matmul(Q,C) # Store the factor matrices
+    
+    # Adjust the factor matrices to generate a bottleneck if specified:
+    if bottleneck==1:
+        U[1] = np.random.normal(0,np.std(U),[I,R])
+        U[2] = np.random.normal(0,np.std(U),[I,R])
+    elif bottleneck==2:
+        U[2] = np.random.normal(0,np.std(U),[I,R])
+    
+    # Turn the Khatri-product of factor matrices into full tensor:
+    Z = tl.kruskal_to_tensor(U)
+    
+    # Generate two random normal tensors for the purpose of adding noise to Z:
+    N1 = np.random.normal(0,1,[I,I,I])
+    N2 = np.random.normal(0,1,[I,I,I])
+    nZ = np.linalg.norm(Z) # Norm of Z
+    nN1 = np.linalg.norm(N1) # Norm of N1
+    
+    # Generate Zprime by adding homoscedastic noise to Z:
+    if l1>0:
+        Zprime = Z + 1/np.sqrt(100/l1-1)*nZ/nN1*N1
+        nZprime = np.linalg.norm(Zprime)
+    else: 
+        Zprime = Z
+        nZprime = nZ
+    
+    N2Zprime = np.multiply(N2,Zprime)
+    nN2Zprime = np.linalg.norm(N2Zprime)
+    
+    # Generate Zdprime by adding heteroscedastic noise to Z:
+    if l2>0:
+        Zdprime = Zprime + 1/np.sqrt(100/l2 - 1)*nZprime/nN2Zprime*N2Zprime
+    else: 
+        Zdprime = Zprime
+        
+    if torch_tensor==True:
+        Z = torch.from_numpy(Z)
+        Zprime = torch.from_numpy(Zprime)
+        Zdprime = torch.from_numpy(Zdprime)
+        
+    return Z, Zprime, Zdprime, U
+
+if __name__ == '__main__':
+    # Example call:
+    claus = load_claus(torch_tensor=False)
+    print(claus)
