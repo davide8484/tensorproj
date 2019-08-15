@@ -1,0 +1,1368 @@
+
+"""
+------
+INTRO
+------
+The functions below are used to implement Nesterov-accelerated ALS methods for 
+canonical tensor decomposition. The main functions are:
+* decomp, which runs Nesterov-accelerated ALS with restart and a fixed momentum 
+weight. This function can also be used to run normal ALS. See the function's 
+notes for details.
+* decomp_ls, which runs Nesterov-accelerated ALS with line search to find the 
+momentum weight. It allows the user to specify the type of line search to use:
+backtracking or extrapolation-bisection. See the function's notes for details. 
+Most of the remaining functions defined below are used within decomp and/or 
+decomp_ls.
+Below are two example function calls for decomp and decomp_ls. NOTE: the decomp function 
+takes a numpy array as the input tensor; the decomp_ls function takes a torch tensor 
+as the input tensor. 
+"""
+
+# Decomp using Nesterov accleration with restart:
+#tensor = load_claus() # Load example tensor
+#elapsed_time, errors, curr_factors, iter_times_s1 = decomp(tensor=tensor, rank=3, n_iter_max=100, random_state=1234, tol=10e-6, momentum_weight=1, inject_noise=1, mu=0, sig=10)
+
+# Decomp using Nesterov acceleration with line search:
+#tensor = load_claus(torch_tensor=True) # Load the example tensor as a torch tensor
+#elapsed_time, errors, curr_factors, iter_times = decomp_ls(tensor=tensor, rank=3, n_iter_max=100, random_state=2, tol=10e-6, ls_type='backtracking', alpha=1, c1=0.3, c2=0.7, deflator=0.5, max_ls_evaluations=2, accept_partial_search=True)
+
+
+# Import required packages:
+import numpy as np
+import warnings
+import tensorly as tl
+import torch # pytorch
+import time
+
+
+def check_random_state(seed):
+    """Returns a valid RandomState
+    Parameters
+    ----------
+    seed : None or instance of int or np.random.RandomState(), default is None
+    Returns
+    -------
+    Valid instance np.random.RandomState
+    Notes
+    -----
+    Inspired by the scikit-learn eponymous function
+    """
+    if seed is None or isinstance(seed, int):
+        return np.random.RandomState(seed)
+
+    elif isinstance(seed, np.random.RandomState):
+        return seed
+
+    raise ValueError('Seed should be None, int or np.random.RandomState')
+
+
+def initialize_factors(tensor, rank, init, svd, random_state, non_negative):
+    r"""Initialize factors used in `parafac`.
+    The type of initialization is set using `init`. If `init == 'random'` then
+    initialize factor matrices using `random_state`. If `init == 'svd'` then
+    initialize the `m`th factor matrix using the `rank` left singular vectors
+    of the `m`th unfolding of the input tensor.
+    Parameters
+    ----------
+    tensor : ndarray
+    rank : int
+    init : {'svd', 'random'}, optional
+    svd : str, default is 'numpy_svd'
+        function to use to compute the SVD, acceptable values in tensorly.SVD_FUNS
+    non_negative : bool, default is False
+        if True, non-negative factors are returned
+    Returns
+    -------
+    factors : ndarray list
+        List of initialized factors of the CP decomposition where element `i`
+        is of shape (tensor.shape[i], rank)
+    """
+    rng = check_random_state(random_state) 
+
+    if init == 'random':
+        factors = [tl.tensor(rng.random_sample((tensor.shape[i], rank)), **tl.context(tensor)) for i in range(tl.ndim(tensor))]
+        if non_negative:
+            return [tl.abs(f) for f in factors]
+        else:
+            return factors
+
+    elif init == 'svd':
+        try:
+            svd_fun = tl.SVD_FUNS[svd]
+        except KeyError:
+            message = 'Got svd={}. However, for the current backend ({}), the possible choices are {}'.format(
+                    svd, tl.get_backend(), tl.SVD_FUNS)
+            raise ValueError(message)
+
+        factors = []
+        for mode in range(tl.ndim(tensor)):
+            U, _, _ = svd_fun(unfold(tensor, mode), n_eigenvecs=rank)
+
+            if tensor.shape[mode] < rank:
+                random_part = tl.tensor(rng.random_sample((U.shape[0], rank - tl.shape(tensor)[mode])), **tl.context(tensor))
+                U = tl.concatenate([U, random_part], axis=1)
+            if non_negative:
+                factors.append(tl.abs(U[:, :rank]))
+            else:
+                factors.append(U[:, :rank])
+        return factors
+
+    raise ValueError('Initialization method "{}" not recognized'.format(init))
+
+
+def ALS(tensor, factors, rank):
+    
+    """ 
+    
+    This function performs one ALS step.
+    
+    Inputs
+    -------
+    - factors: list containing the factor matrices. Each factor matrix is a numpy array
+    - rank: the chosen rank for the tensor decomposition
+    
+    Outputs
+    -------
+    - curr_factors: the new set of factor matrices after applying an ALS step 
+    to 'factors'
+    
+    
+    """
+    
+    for mode in range(tl.ndim(tensor)): 
+        pseudo_inverse = tl.tensor(np.ones((rank, rank)), **tl.context(tensor))
+        for i, factor in enumerate(factors):
+            if i != mode:
+                pseudo_inverse = pseudo_inverse*tl.dot(tl.transpose(factor), factor)
+        factor = tl.dot(tl.unfold(tensor, mode), tl.tenalg.khatri_rao(factors, skip_matrix=mode))
+        factor = tl.transpose(tl.solve(tl.transpose(pseudo_inverse), tl.transpose(factor)))
+        factors[mode] = factor 
+    curr_factors = factors.copy() # Updated factor matrices
+    return curr_factors
+
+
+
+def ALS_vector(x,y,z,rank):
+    
+    """
+    
+    This function takes a vector x containing all the elements of all the 
+    factor matrices, reconstructs the factor matrices (puts them in correct 
+    shape), applies an ALS step to obtain the updated factor matrices, and 
+    returns a vector x1 containing all the elements of the updated factor 
+    matrices. 
+    
+    Inputs
+    ------
+    1. x: vector containing all the elements of the current iteration's factor 
+    matrices.
+    2. y: the current iteration's factor matrices in correct form (i.e. as 
+    matrices).
+    3. z: the actual tensor.
+    
+    Outputs
+    ------
+    1. x1: vector containing all the elements of the next iteration's factor
+    matrices after the application of an ALS step to x. 
+    
+    """
+    
+    # Put the factor matrices, which are stored in vector x, in matrix form:
+    recon = [] # To store the reconstructed factors
+    start_point = 0
+    for i in range(len(y)):
+        n = y[i].numel()
+        recon.append(x[start_point:(start_point+n)].view(y[i].shape))
+        start_point += n
+    factors = recon 
+    
+    # Apply ALS step to get updated factor matrices:
+    for mode in range(tl.ndim(z)): # Iterating over the 3 'dimensions' of the tensor
+        pseudo_inverse = tl.tensor(np.ones((rank, rank)), **tl.context(z))
+        for i, factor in enumerate(factors):
+            if i != mode:
+                pseudo_inverse = pseudo_inverse*tl.dot(tl.transpose(factor), factor)
+        factor = tl.dot(tl.unfold(z, mode), tl.tenalg.khatri_rao(factors, skip_matrix=mode))
+        factor = tl.transpose(tl.solve(tl.transpose(pseudo_inverse), tl.transpose(factor)))
+        factors[mode] = factor # So this produces factor matrices for mode=1, ..., tensor.dim   
+    new_factors = factors
+
+    # Put the elements of updated factor matrices in vector x1:
+    x1 = torch.cat([factor.reshape(1, -1).squeeze() for factor in new_factors])
+    return x1
+
+
+def g(x,curr_factors):
+    
+    """
+    
+    This function: (i) takes x (a vector containing the elements from all the 
+    factor matrices), (ii) converts it to the correctly shaped factor matrices, 
+    (iii) uses the factor matrices to reconstruct the tensor, and (iv) 
+    evaluates the objective function f.
+    
+    Inputs
+    ------
+        1. x: a vector containing the elements from all the current iteration's
+        factor matrices
+        2. curr_factors: the current set of factor matrices (in factor matrix form)
+        
+    Output
+    ------
+        f(x): the Frobenius norm of the tensor reconstruction error
+    
+    """
+    
+    recon_factors = [] # To store the reconstructed factors (the ones we reconstruct within the function)
+
+    start_point = 0
+    for i in range(len(curr_factors)):
+        n = curr_factors[i].numel()
+        recon_factors.append(x[start_point:(start_point+n)].view(curr_factors[i].shape))
+        start_point += n
+    recon = tl.kruskal_to_tensor(recon_factors)
+    recon_errors = tensor - recon
+    return recon_errors.pow(2).sum().sqrt()
+
+
+def test_func(x,curr_factors):
+    
+    """
+    This function returns g above.
+    """
+    
+    print('call f')
+    return g(x,curr_factors)
+
+
+def test_grad(x,curr_factors):
+    
+    """
+    This function returns the gradient of f with respect to the factor matrices.
+    
+    Inputs
+    ------
+    1. x: a vector containing the elements from all the current iteration's 
+    factor matrices.
+    2. curr_factors: the current iteration's factor matrices.
+    
+    Outputs
+    ------
+    1. The gradient of f with respect to the factor matrices contained in x
+    
+    """
+    
+    print('call g')
+    x_copy = torch.tensor(x, requires_grad=True)
+    y = g(x_copy,curr_factors)
+    y.backward()
+    grad_y = x_copy.grad
+    return grad_y.detach()
+
+
+
+def test_grad2(x,curr_factors):
+    
+    """
+    This function returns both f and the gradient of f with respect to the factor matrices.
+    
+    Inputs
+    ------
+    1. x: a vector containing the elements from all the current iteration's 
+    factor matrices.
+    2. curr_factors: the current iteration's factor matrices.
+    
+    Outputs
+    ------
+    1. The gradient of f with respect to the factor matrices contained in x
+    2. y: the function value
+    
+    """
+    
+    print('call g')
+    x_copy = torch.tensor(x, requires_grad=True)
+    y = g(x_copy,curr_factors)
+    y.backward()
+    grad_y = x_copy.grad
+    return_grad = grad_y.detach()
+    return return_grad, y
+
+
+
+def bisection_line_search(alpha,c1,c2,max_ls_evaluations,accept_partial_search,x1,curr_factors,step_direction):
+    
+    """
+    
+    This function implements extrapolation-bisection line search to search for
+    a good momentum weight (step size) to use in each iteration of 
+    Nesterov-accelerated ALS. It delivers a step size that satisfies the Weak 
+    Wolfe Conditions. Reference: algorithm 3.1 on page 31 in 'Optimization for 
+    Modern Data Analysis' by Benjamin Recht and Stephen Wright. 
+    
+    Inputs
+    ------
+        1. alpha: the initial step size. Usually set to 1.
+        2. c1: parameter controlling the sufficient decrease condition. Larger 
+        c1 requires a larger decrease in f for the step size to be accepted. 
+        Note: 0 < c1 < c2 < 1
+        3. c2: parameter controlling the gradient condition. Ensures that we 
+        move far enough along the step direction that the directional derivative 
+        of f is substantially less negative than its value at alpha=0, or is 
+        zero or positive. Larger c2 gives a larger move along the step direction.
+        Note: 0 < c1 < c2 < 1
+        4. max_ls_evaluations: the maximum number of line searches to perform 
+        in each iteration. 
+        5. accept_partial_search: the final iteration of line search can give 
+        an alpha that does not satisfy the Weak Wolfe Conditions. Set 
+        accept_partial_search=True to accept this alpha anyway, or 
+        accept_partial_search=False to set alpha=0, which forces a normal ALS
+        update (guaranteed to decrease f).
+        6. x1: a vector containing the current iteration's factor matrices.
+        7. curr_factors: the current iteration's factor matrices in matrix form
+        8. step_direction: step direction for line search. We use x1 - x0 for 
+        Nesterov accelerated methods, where x0 is a vector containing the 
+        previous iteration's factor matrices.
+    
+    Outputs
+    ------
+        1. beta: the step size
+    
+    """
+    
+    # Set the upper and lower bounds:
+    U = np.inf
+    L = 0
+    
+    # Initialise flag for whether the Weak Wolfe Conditions are satisfied:
+    wolfe_conds_satisfied = 0
+
+    # If step direction is not a descent direction, then set alpha=0, which forces a normal ALS update:
+    if np.dot(test_grad(x1,curr_factors),step_direction) >= 0: 
+        alpha = 0
+    
+    # Otherwise, if step direction is a descent direction, then use line search to find step length (alpha):
+    else:
+        for j in range(max_ls_evaluations):  
+            
+            # Compute a few values used in the following if statements:
+            val1 = np.dot(test_grad(x1,curr_factors),step_direction)
+            cond1 = test_func(x1 + alpha*step_direction,curr_factors)
+            cond2 = test_func(x1,curr_factors) + c1*alpha*val1
+            cond3 = np.dot(test_grad(x1 + alpha*step_direction,curr_factors), step_direction) 
+            cond4 = c2*val1
+            
+            # If Weak Wolfe Conditions not satisfied, search for new alpha:
+            if cond1 > cond2:
+                U = alpha
+                alpha = (U + L)/2
+            elif cond3 < cond4:
+                L = alpha
+                if U == np.inf:
+                    alpha = 2*L
+                else: 
+                    alpha = (L + U)/2
+                    
+            # If Weak Wolfe Conditions satisfied, accept alpha:
+            else:
+                wolfe_conds_satisfied = 1 # Flag that conditions are satisfied
+                break
+
+    # If Weak Wolfe Conditions are not satisfied by the final line search iteration, 
+    # we can either accept the alpha from that line search iteration, or set 
+    # alpha=0 to force a normal ALS update:
+    if accept_partial_search == False:
+        if wolfe_conds_satisfied == 0:
+            alpha = 0
+        
+    beta=alpha
+    return beta
+
+
+def backtracking_line_search(alpha,c1,deflator,max_ls_evaluations,accept_partial_search,x1,curr_factors,step_direction):
+    
+    """
+    
+    This function implements a simple version of backtracking line search to 
+    search for a good momentum weight (step size) to use in each iteration of
+    Nesterov-accelerated ALS. It delivers a step size that satisfies a 
+    sufficient decrease condition on f. Reference: pages 30-32 in 'Optimization 
+    for Modern Data Analysis' by Benjamin Recht and Stephen Wright.
+    
+    Inputs
+    ------
+        1. alpha: the initial step size. Usually set to 1.
+        2. c1: parameter controlling the sufficient decrease condition. Larger 
+        c1 requires a larger decrease in f for the step size to be accepted. 
+        Note: 0 < c1 < 1
+        3. max_ls_evaluations: the maximum number of line searches to perform 
+        in each iteration. 
+        4. accept_partial_search: the final iteration of line search can give 
+        an alpha that does not satisfy the sufficient decrease condition, but 
+        may decrease f nonetheless. Set accept_partial_search=True to accept 
+        this alpha anyway, or accept_partial_search=False to set alpha=0, 
+        which forces a normal ALS update (guaranteed to decrease f).
+        6. x1: a vector containing the current iteration's factor matrices.
+        7. curr_factors: the current iteration's factor matrices in matrix form
+        8. step_direction: step direction for line search. We use x1 - x0 for 
+        Nesterov accelerated methods, where x0 is a vector containing the 
+        previous iteration's factor matrices.
+    Outputs
+    ------
+        1. beta: the step size
+    
+    """
+
+    # If step direction is not a descent direction, then set alpha=0, which forces a normal ALS update:
+    if np.dot(test_grad(x1,curr_factors),step_direction) >= 0: 
+        alpha = 0
+    
+    # Otherwise, if step direction is a descent direction, then use line search to find step length (alpha):
+    else:
+        for j in range(max_ls_evaluations):  
+            
+            # Compute a few values used in the following if statement:
+            val1 = np.dot(test_grad(x1,curr_factors),step_direction)
+            cond1 = test_func(x1 + alpha*step_direction,curr_factors)
+            cond2 = test_func(x1,curr_factors) + c1*alpha*val1
+            
+            # If sufficient decrease condition not satisfied, search for new alpha:
+            if cond1 > cond2:
+                alpha = alpha * deflator
+            else:
+                suff_decrease_satisfied = 1 # Flag that sufficient decrease condition met
+                break
+    
+    # If the sufficient decrease condition has not been satisfied and we are 
+    # not accepting the alpha from partial search, then set alpha=0 so that a 
+    # normal ALS step is performed:
+    if accept_partial_search == False and suff_decrease_satisfied == 0:
+        alpha = 0
+        
+    beta=alpha
+    return beta
+
+
+
+
+def decomp(tensor, rank, n_iter_max, random_state, tol, momentum_weight, inject_noise, mu, sig):
+    
+    """
+    This function uses ALS-based methods to obtain a low-rank canonical tensor
+    decomposition of a given tensor. It can be used to run standard ALS, and 
+    Nesterov-accelerated versions of ALS. 
+    Inputs
+    -------
+        - 'tensor': the name of the data array (can be any dimension)
+        - 'rank': the rank of the decomposition to perform
+        - 'n_iter_max': the maximum number of iterations to run the algorithm for
+        - 'random_state': random seed for initialisation of factor matrices
+        - 'tol': the tolerance for the stopping criterion
+        - 'momentum_weight': the fixed weight to use if restart does not occur.
+        Typically 0.5-2. 
+        - 'inject_noise: specifies whether to inject Gaussian noise into the factor
+        matrices on the path to convergence. Set at 1 for noise, 0 for no noise
+        
+    Outputs
+    -------
+        - 'elapsed_time': time to convergence
+        - 'errors': the Frobenius error produced from the reconstruction of the 
+        tensor at each iteration
+        - 'curr_factors': the set of factor matrices upon convergence
+        - 'iter_times_s1': the time taken for each iteration
+        
+    Special cases
+    -------
+        - Setting momentum_weight=1 and inject_noise=0 gives the S1 algorithm
+        - Setting momentum_weight=0 and inject_noise=0 gives standard ALS
+    
+    """
+    
+    tl.set_backend('numpy')
+    
+    # 1. Generate initial factor matrices x1:
+    iter1_start_time = time.time()
+    factors = initialize_factors(tensor, rank, init='random', svd='numpy_svd', random_state=random_state, non_negative=False) 
+    prev_factors2 = factors[:] 
+    iter1_time = (time.time() - iter1_start_time)
+    
+    # 2. Generate x2: x2 <- ALS(x1):
+    iter2_start_time = time.time()
+    curr_factors = ALS(tensor, factors=factors, rank=rank) 
+    iter2_time = (time.time() - iter2_start_time)
+    
+    # 3. Initialise parameters / storage of output for further iterations:
+    j = 2 # Set the no. of iterates since restarting 
+    
+    beta = 0 # Set the initial momentum weight
+    betas = []
+    betas.append(beta) 
+    
+    restart = 0 # Indicator of restart
+    restarts=[] # Store indicators of restart
+    
+    stoppings = [] # To track the value of the stopping criterion
+    norm_tensor = tl.norm(tensor, 2) # Compute the tensor norm (used in the stopping criterion)
+    
+    # Get iteration times for plots:
+    iter_times_s1=[] # Store the time taken for each iteration
+    iter_times_s1.append(iter1_time) # Append comp time for first iter
+    iter_times_s1.append(iter2_time) # Append comp time for second iter
+    
+    # Compute and store errors for first 2 iterations:
+    prev_error = tl.norm(tensor - tl.kruskal_to_tensor(prev_factors2)) 
+    curr_error = tl.norm(tensor - tl.kruskal_to_tensor(curr_factors)) 
+    errors=[]
+    errors.append(prev_error)
+    errors.append(curr_error)
+    
+    flag_noise = 0 # Initialise flag indicating whether Gaussian noise has been injected
+    
+    # 4. Run the main algorithm:
+    
+    start_time = time.time()
+    
+    for k in range(2, n_iter_max): 
+        
+        # Check for restart and set momentum weight:
+        iter_start_time = time.time()
+        curr_error = errors[k-1]
+        prev_error = errors[k-2]
+        if curr_error>prev_error and beta !=0:
+            curr_factors = prev_factors2
+            beta = 0
+            j = 1 
+            restart=1
+        else:
+            restart=0
+            beta = momentum_weight 
+        stopping = abs(prev_error - curr_error)/norm_tensor # Compute the change in f, normalised
+        stoppings.append(stopping)
+        betas.append(beta) 
+        restarts.append(restart)
+        
+        # Inject Gaussian noise into curr_factors as it approaches convergence:
+        if inject_noise == 1 and abs(errors[-1] - errors[-2])/norm_tensor < 10*tol and flag_noise == 0:
+            np.random.seed(1)
+            shocked = [x + np.random.normal(mu,sig) for x in curr_factors]
+            curr_factors = shocked.copy()
+            flag_noise = 1 # Flag that noise has been injected once
+        
+        # If the stopping criterion is met, stop running alg:
+        if stopping < tol:
+            break
+    
+        # Compute the acclerated term x(k) + beta(k)(x(k) - x(k-1)):
+        acc_term = [curr_factors - prev_factors2 for curr_factors, prev_factors2 in zip(curr_factors, prev_factors2)]
+        acc_term2 = [x * beta for x in acc_term]
+        acc = [curr_factors + acc_term2 for curr_factors, acc_term2 in zip(curr_factors, acc_term2)]
+        
+        # Set the previous factors as the current factors for the next iteration:
+        prev_factors2 = curr_factors[:]
+        
+        # Apply ALS to the accelerated term to obtain updated factor matrices (code straight from Tensorly):
+        factors = acc  
+        curr_factors = ALS(tensor, factors=factors, rank=rank)
+        
+        # Compute and store the error given by the updated factor matrices in reconstructing the tensor:
+        curr_error = tl.norm(tensor - tl.kruskal_to_tensor(curr_factors)) 
+        errors.append(curr_error)
+        
+        # Count number of iterations since restart:
+        j = j+1
+        
+        # Iteration timer:
+        iter_time = (time.time() - iter_start_time)
+        iter_times_s1.append(iter_time)
+    
+    elapsed_time = (time.time() - start_time)     
+        
+    elapsed_time
+
+    return elapsed_time, errors, curr_factors, iter_times_s1, betas, k
+
+
+def decomp_ls(tensor, rank, n_iter_max, random_state, tol, ls_type, alpha, c1, c2, deflator, max_ls_evaluations, accept_partial_search):
+    
+    """
+    This function uses Nesterov-accelerated ALS to obtain a low-rank canonical 
+    tensor decomposition of a given tensor. Line search is used to obtain the 
+    momentum weight. 
+    
+    Inputs
+    -------
+        1. 'tensor': the name of the data array (can be any dimension)
+        2. 'rank': the rank of the decomposition to perform
+        3. 'n_iter_max': the maximum number of iterations to run the algorithm for
+        4. 'random_state': random seed for initialisation of factor matrices
+        5. 'tol': the tolerance for the stopping criterion
+        6. 'ls_type': set to 'backtracking_ls' for backtracking line search, or 
+        7. 'bisection_ls' for bisection line search
+        8. alpha, c1, c2, max_ls_evaluations, accept_partial_search: parameters 
+        for bisection line search. See the function
+        9. alpha, c1, deflator, max_ls_evaluations, accept_partial_search: 
+        parameters for backtracking line search. See the function
+        
+    Outputs
+    -------
+        1. 'elapsed_time': time to convergence
+        2. 'errors': the Frobenius error produced from the reconstruction of the 
+        tensor at each iteration
+        3. 'curr_factors': the set of factor matrices upon convergence
+        4. 'iter_times': the time taken for each iteration
+    
+    """
+    
+    tl.set_backend('pytorch')
+
+    # Generate factor matrices for first iteration:    
+    iter1_start_time = time.time()
+    factors = initialize_factors(tensor, rank, init='random', svd='numpy_svd', random_state=random_state, non_negative=False) 
+    prev_factors2 = factors[:]
+    iter1_time = (time.time() - iter1_start_time)
+    
+    # Put factor matrices into single vector:
+    x0 = torch.cat([factor.reshape(1, -1).squeeze() for factor in prev_factors2])
+    
+    # Generate factor matrices for second iteration by applying ALS step to initial matrices:
+    iter2_start_time = time.time()
+    curr_factors = ALS(tensor, factors=factors, rank=rank) 
+    iter2_time = (time.time() - iter2_start_time)
+    
+    # Put matrices in single vector:
+    x1 = torch.cat([factor.reshape(1, -1).squeeze() for factor in curr_factors])
+    
+    # Set up objects to store each iteration's beta, error, and comp time:
+    betas = []
+    betas.append(0) # First iteration is randomly generated factor matrices (beta=0) 
+    betas.append(0) # Second iteration is ALS (beta=0)
+    errors = []
+    errors.append(test_func(x0,curr_factors)) # Evaluate and store f for initial factor matrices x0
+    errors.append(test_func(x1,curr_factors)) # Evaluate and store f for x1<-ALS(x0)
+    iter_times=[] 
+    iter_times.append(iter1_time) # Comp time for first iteration
+    iter_times.append(iter2_time) # Comp time for second iteration
+    
+    norm_tensor = tl.norm(tensor, 2) # Compute the norm of the tensor for our stopping criterion
+    
+    start_time = time.time()
+    
+    for k in range(2, n_iter_max):
+        iter_start_time = time.time()
+        
+        # Get the step direction and start point for line search:
+        step_direction = x1 - x0
+        start_from = x1
+
+        if ls_type=='bisection':
+            beta = bisection_line_search(alpha,c1,c2,max_ls_evaluations,accept_partial_search,x1,curr_factors,step_direction)
+        elif ls_type=='backtracking':
+            beta = backtracking_line_search(alpha,c1,deflator,max_ls_evaluations,accept_partial_search,x1,curr_factors,step_direction)
+    
+        betas.append(beta) # Store beta
+    
+        # Do step x_{k+1} = ALS(x_{k} + beta x step_direction):
+        acc_term = start_from + beta*step_direction # Get the accelerated term to apply ALS to
+        x0 = x1 # Update x0 for the next iteration
+        x1 = ALS_vector(acc_term, curr_factors, tensor, rank) # Compute x_{k+1}
+        errors.append(test_func(x1,curr_factors)) # Store the new value of objective function f
+
+        # If stopping criterion reached, then stop loop:
+        stopping = abs(errors[-1] - errors[-2])/norm_tensor # Compute the change in f, normalised
+        if stopping < tol:
+            break
+        
+        # Store iteration times:
+        iter_time = (time.time() - iter_start_time)
+        iter_times.append(iter_time)
+    
+    elapsed_time = (time.time() - start_time)     
+    
+    return elapsed_time, errors, curr_factors, iter_times, betas, k
+
+
+
+def decomp_momentum(tensor, rank, n_iter_max, random_state, tol, rho, momentum_weight):
+    
+    """
+    This function uses Nesterov-accelerated ALS to obtain a low-rank canonical 
+    tensor decomposition of a given tensor. Two momentum terms are used, rather 
+    than one in the standard momentum method. 
+    
+    Inputs
+    -------
+    1. tensor: the name of the data array (can be any dimension)
+    2. rank: the rank of the decomposition
+    3. n_iter_max: the maximum number of iterations to run the alg for
+    4. random_state: random seed for initialisation of factor matrices
+    5. tol: the tolerance for the stopping criterion
+    6. rho: weight to apply to lagged momentum
+    7. momentum_weight: weight to apply to latest momentum
+        
+    Outputs
+    -------
+    1. elapsed_time: time to convergence
+    2. errors: the Frobenius error produced from the reconstruction of the 
+    tensor at each iteration
+    3. curr_factors: the set of factor matrices upon convergence
+    4. iter_times: the time taken for each iteration
+    
+    """
+
+    tl.set_backend('pytorch')
+
+    # Generate factor matrices for first iteration:    
+    iter1_start_time = time.time()
+    factors = initialize_factors(tensor, rank, init='random', svd='numpy_svd', random_state=random_state, non_negative=False) 
+    prev_factors2 = factors[:]
+    iter1_time = (time.time() - iter1_start_time)
+    
+    # Put factor matrices into single vector:
+    x0 = torch.cat([factor.reshape(1, -1).squeeze() for factor in prev_factors2])
+    
+    # Generate factor matrices for second iteration by applying ALS step to initial matrices:
+    iter2_start_time = time.time()
+    curr_factors = ALS(tensor=tensor, factors=factors, rank=rank) 
+    iter2_time = (time.time() - iter2_start_time)
+    
+    # Put matrices in single vector:
+    x1 = torch.cat([factor.reshape(1, -1).squeeze() for factor in curr_factors])
+    
+    # Generate factor matrices for third iteration by applying ALS step to x1:
+    iter3_start_time = time.time()
+    curr_factors = ALS(tensor=tensor, factors=curr_factors, rank=rank)
+    iter3_time = (time.time() - iter3_start_time)
+    
+    x2 = torch.cat([factor.reshape(1, -1).squeeze() for factor in curr_factors])
+    
+    # Set up objects to store each iteration's beta, error, and comp time:
+    betas = []
+    betas.append(0) # First iteration is randomly generated factor matrices (beta=0) 
+    betas.append(0) # Second iteration is ALS (beta=0)
+    betas.append(0) # Third iteration 
+    beta=0
+    errors = []
+    errors.append(test_func(x0,curr_factors)) # Evaluate and store f for initial factor matrices x0
+    errors.append(test_func(x1,curr_factors)) # Evaluate and store f for x1<-ALS(x0)
+    errors.append(test_func(x2,curr_factors))
+    iter_times=[] 
+    iter_times.append(iter1_time) # Comp time for first iteration
+    iter_times.append(iter2_time) # Comp time for second iteration
+    iter_times.append(iter3_time) # Comp time for third iteration
+    
+    norm_tensor = tl.norm(tensor, 2) # Compute the norm of the tensor for our stopping criterion
+    
+    start_time = time.time()
+    
+    for k in range(3, n_iter_max):
+        iter_start_time = time.time()
+        
+        # Check for restart and set momentum weight:
+        curr_error = errors[k-1]
+        prev_error = errors[k-2]
+        if curr_error>prev_error and beta !=0:
+            x2 = x1
+            beta = 0
+        else:
+            beta = momentum_weight 
+
+        betas.append(beta) # Store beta
+       
+        # Compute the new point to apply ALS to:
+        acc_term = x2 + beta*(x2-x1) + rho*(x1-x0)
+        
+        # Update factor matrices for next iteration:
+        x0 = x1
+        x1 = x2 
+        x2 = ALS_vector(acc_term, curr_factors, tensor, rank)
+       
+        errors.append(test_func(x2,curr_factors)) # Store the new value of objective function f
+
+        # If stopping criterion reached, then stop loop:
+        stopping = abs(errors[-1] - errors[-2])/norm_tensor # Compute the change in f, normalised
+        if stopping < tol:
+            break
+        
+        # Store iteration times:
+        iter_time = (time.time() - iter_start_time)
+        iter_times.append(iter_time)
+    
+    elapsed_time = (time.time() - start_time)     
+    
+    return elapsed_time, errors, curr_factors, iter_times
+
+
+
+
+
+
+
+def decomp_grad_ratio_weight(tensor, rank, n_iter_max, random_state, tol):
+    
+    """
+    
+    This function implements Nesterov-accelerated ALS with gradient ratio
+    momentum weights and function restarting. 
+    
+    Inputs
+    ------
+    1. tensor: the name of the tensor. Must be a torch tensor. Can be any 
+    dimension.
+    2. rank: the rank of the decomposition.
+    3. n_iter_max: maximum number of iterations to run the algorithm for.
+    4. random_state: random seed for initialisation of factor matrices.
+    5. tol: convergence tolerance.
+    
+    Outputs
+    ------
+    1. elapsed_time: total run time for the algorithm
+    2. errors: the error at each iteration of the algorithm
+    3. curr_factors: the factor matrices upon convergence
+    4. iter_times: the time taken for each iteration
+    5. betas: contains the momentum weights used across the iterations
+    
+    """
+    
+    tl.set_backend('pytorch')
+
+    iter_times = []
+
+    # Generate factor matrices for first iteration:    
+    iter1_start_time = time.time()
+    factors = initialize_factors(tensor, rank, init='random', svd='numpy_svd', random_state=random_state, non_negative=False) 
+    prev_factors2 = factors[:]
+    iter1_time = (time.time() - iter1_start_time)
+    iter_times.append(iter1_time)
+    
+    # Put factor matrices into single vector:
+    x0 = torch.cat([factor.reshape(1, -1).squeeze() for factor in prev_factors2])
+    
+    # Apply normal ALS step to x0 to obtain factors for iteration 2:
+    iter2_start_time = time.time()
+    curr_factors = ALS(tensor=tensor,factors=factors, rank=rank) 
+    iter2_time = (time.time() - iter2_start_time)
+    iter_times.append(iter2_time)
+    
+    # Put matrices in single vector:
+    x1 = torch.cat([factor.reshape(1, -1).squeeze() for factor in curr_factors])
+    
+    # Store errors:
+    errors = []
+    errors.append(test_func(x0,curr_factors))
+    errors.append(test_func(x1,curr_factors))
+    
+    start_time = time.time() # Start timing time to convergence
+    
+    # Run a further 5 iterations of normal ALS to stabilise the system before 
+    # computing gradient ratio weights (otherwise divergence is likely to occur:
+    for i in range(5):
+        iter_start_time = time.time()
+        x0 = x1
+        x1 = ALS_vector(x0,curr_factors, tensor, rank)
+        errors.append(test_func(x1,curr_factors))
+        iter_time = (time.time() - iter_start_time)
+        iter_times.append(iter_time)
+        
+    # Store momentum weights produced by gradient ratio method:
+    betas = []
+    beta=0
+    betas.append(beta)
+    
+    norm_tensor = tl.norm(tensor, 2) # Compute the norm of the tensor for our stopping criterion
+    
+    # Compute the gradient norm of x0 for the first momentum weight in below loop:
+    grad_norm_x0 = test_grad(x0,curr_factors).pow(2).sum().sqrt()
+    grad_norms = []
+    grad_norms.append(grad_norm_x0)
+    
+    for k in range(7, n_iter_max):
+        iter_start_time = time.time()
+        
+        # Check for restart and set momentum weight:
+        curr_error = errors[k-1]
+        prev_error = errors[k-2]
+        if curr_error>prev_error and beta !=0:
+            x1 = x0
+            beta = 0
+        else:
+            grad_norm_x1 = test_grad(x1,curr_factors).pow(2).sum().sqrt()
+            grad_norms.append(grad_norm_x1)
+            beta = grad_norms[-1]/grad_norms[-2]
+            
+            #beta = grad_norm_x1 / grad_norm_x0
+            #beta = test_grad(x1,curr_factors).pow(2).sum().sqrt()/test_grad(x0,curr_factors).pow(2).sum().sqrt()
+
+        betas.append(beta) # Store beta
+      
+        acc_term = x1 + beta*(x1 - x0)
+        
+        x0 = x1 # Update x0 for the next iteration
+        x1 = ALS_vector(acc_term, curr_factors, tensor, rank) # Compute x_{k+1}
+        errors.append(test_func(x1,curr_factors)) # Store the new value of objective function f
+
+        # If stopping criterion reached, then stop loop:
+        stopping = abs(errors[-1] - errors[-2])/norm_tensor # Compute the change in f, normalised
+        if stopping < tol:
+            break
+        
+        # Store iteration times:
+        iter_time = (time.time() - iter_start_time)
+        iter_times.append(iter_time)
+    
+    elapsed_time = (time.time() - start_time)     
+
+    return elapsed_time, errors, curr_factors, iter_times, betas, k
+
+
+
+
+
+
+def decomp_fixed_weight(tensor, rank, n_iter_max, random_state, tol, momentum_weight, memory, rho, inject_noise, tol2):
+
+    """
+    
+    This function implements several varieties of Nesterov-accelerated ALS:
+        
+    1. ALS: set momentum_weight=0, memory=False, inject_noise=False
+    2. S1: fixed weight version using only the previous two iterations to compute
+    the momentum term. Set momentum weight>0 (but typically less than 1.5 for 
+    decent performance), memory=False, inject_noise=False.
+    3. S1_memory: fixed weight version using all previous iterations to compute 
+    the momentum (via exponential decay). Setup is same as S1 but with 
+    memory = True, and 0<rho<1 (smaller rho gives faster exponential decay of 
+    older momentum terms in computing the update).
+    4. The option to inject Gaussian noise into the factor matrices as the 
+    progress in convergence slows (get out of swamp/local minimum). Set 
+    inject_noise=True and tol2>tol.
+    
+    
+    Inputs
+    ------
+    1. tensor: the name of the tensor. Must be a torch tensor. Can be any 
+    dimension.
+    2. rank: the rank of the decomposition.
+    3. n_iter_max: maximum number of iterations to run the algorithm for.
+    4. random_state: random seed for initialisation of factor matrices.
+    5. tol: convergence tolerance.
+    6. momentum_weight: the fixed momentum weight to apply.
+    7. memory: set as 'False' for the update in x at time t to use only the 
+    latest momentum term (change in x at time t-1). Set as 'True' to take into 
+    account previous momentum terms with exponential decay.
+    8. rho: decay parameter takes values 0<=rho<=1. Larger rho gives more weight
+    to earlier momentum terms; smaller rho gives more weight to latest momentum
+    term
+    9. inject_noise: set as True to inject Gaussian noise in the factor 
+    matrices in the first iteration when error<10*tol. This can move the system
+    out of local minimum. Otherwise set as False.
+    10. tol2: the tolerance at which to inject noise. Recommended: 10*tol
+    
+    Outputs
+    ------
+    1. elapsed_time: total run time for the algorithm
+    2. errors: the error at each iteration of the algorithm
+    3. curr_factors: the factor matrices upon convergence
+    4. iter_times: the time taken for each iteration
+    5. betas: contains the momentum weights used across the iterations
+    6. flag_noise: the iteration in which noise was injected into the factors
+    
+    """
+    
+    tl.set_backend('pytorch')
+
+   # j=0
+
+    # Generate factor matrices for first iteration:    
+    iter1_start_time = time.time()
+    factors = initialize_factors(tensor, rank, init='random', svd='numpy_svd', random_state=random_state, non_negative=False) 
+    prev_factors2 = factors[:]
+    iter1_time = (time.time() - iter1_start_time)
+    
+    # Put factor matrices into single vector:
+    x0 = torch.cat([factor.reshape(1, -1).squeeze() for factor in prev_factors2])
+    
+    # Generate factor matrices for second iteration by applying ALS step to initial matrices:
+    iter2_start_time = time.time()
+    curr_factors = ALS(tensor=tensor,factors=factors, rank=rank) 
+    iter2_time = (time.time() - iter2_start_time)
+    
+    # Put matrices in single vector:
+    x1 = torch.cat([factor.reshape(1, -1).squeeze() for factor in curr_factors])
+    
+    # Set up objects to store each iteration's beta, error, and comp time:
+    betas = []
+    betas.append(0) # First iteration is randomly generated factor matrices (beta=0) 
+    betas.append(0) # Second iteration is ALS (beta=0)
+    beta=0
+    errors = []
+    errors.append(test_func(x0,curr_factors)) # Evaluate and store f for initial factor matrices x0
+    errors.append(test_func(x1,curr_factors)) # Evaluate and store f for x1<-ALS(x0)
+    #errors.append(test_func(x2,curr_factors))
+    iter_times=[] 
+    iter_times.append(iter1_time) # Comp time for first iteration
+    iter_times.append(iter2_time) # Comp time for second iteration
+    #iter_times.append(iter3_time) 
+    
+    diff = x1-x0 # Initialise the previous difference term (decays)
+    
+    norm_tensor = tl.norm(tensor, 2) # Compute the norm of the tensor for our stopping criterion
+    
+    flag_noise = 0 # Initialise flag indicating whether Gaussian noise has been injected
+    
+    start_time = time.time()
+    
+    for k in range(2, n_iter_max):
+        iter_start_time = time.time()
+        
+        # Check for restart and set momentum weight:
+        curr_error = errors[k-1]
+        prev_error = errors[k-2]
+        if curr_error>prev_error and beta !=0:
+            x1 = x0
+            beta = 0
+        else:
+            beta = momentum_weight 
+
+        betas.append(beta) # Store betas
+      
+        
+        if inject_noise==True and abs(errors[-1] - errors[-2])/norm_tensor < tol2 and flag_noise == 0:
+            np.random.seed(1)
+            
+            # Compute the noise terms for the first factor matrix:
+            noise_terms = np.random.normal(0, x1[0:curr_factors[0].numel()].std(),curr_factors[0].numel())
+            
+            # Append the noise terms for the other factor matrices:
+            for j in range(1,len(tensor.size())):
+                noise = np.random.normal(0, x1[0:curr_factors[j].numel()].std(),curr_factors[j].numel())
+                noise_terms = np.concatenate((noise_terms, noise), axis=0)
+                
+            # Convert to torch tensor:
+            noise_terms = torch.tensor(noise_terms, dtype=torch.float64)
+                
+            # Use the noise terms to perturb the factors:            
+            x1 = x1 + noise_terms
+            flag_noise=k
+        
+        # If stopping criterion reached, then stop loop:
+        stopping = abs(errors[-1] - errors[-2])/norm_tensor # Compute the change in f, normalised
+        if stopping < tol:
+            break
+        
+        # Accelerated term in ALS(acc_term) depends on whether previous momentum terms are captured:
+        if memory == True: # Capture previous momentum terms
+            diff = rho*diff + (1-rho)*(x1-x0) # Update diff term (exponential decay)
+            acc_term = x1 + beta*diff
+        elif memory == False: # Use only the latest momentum term
+            acc_term = x1 + beta*(x1 - x0) # Compute accelerated term
+        
+        x0 = x1 # Update x0 for the next iteration
+        x1 = ALS_vector(acc_term, curr_factors, tensor, rank) # Compute x_{k+1}
+        errors.append(test_func(x1,curr_factors)) # Store the new value of objective function f
+        
+        # Store iteration times:
+        iter_time = (time.time() - iter_start_time)
+        iter_times.append(iter_time)
+    
+    elapsed_time = (time.time() - start_time)     
+
+    return elapsed_time, errors, curr_factors, iter_times, betas, flag_noise, k
+
+
+def ALS_adadelta(tensor, rank, n_iter_max, random_state, tol, eta, epsilon, rho):  
+    
+    """
+    
+    This function implements ALS with ADADELTA and function restarting. 
+    For full details, see the paper 'Adadelta: An adaptive learning rate method'
+    by M. Zeiler (2012). The update equation for each iteration is:
+        
+        x(k+1) = x(k) + change_in_x
+    
+    where change_in_x is defined by equation 14 in the above paper. Function 
+    restarting works as follows: if a bad step is made (increase in f), we go 
+    back to the start point and do a normal ALS update (which guarantees a 
+    decrease in f).
+    
+    """
+    
+
+    tl.set_backend('pytorch')
+    
+    iter_times = []
+    
+    # Generate factor matrices for first iteration:    
+    iter1_start_time = time.time()
+    factors = initialize_factors(tensor, rank, init='random', svd='numpy_svd', random_state=random_state, non_negative=False) 
+    prev_factors2 = factors[:]
+    iter1_time = (time.time() - iter1_start_time)
+    iter_times.append(iter1_time)
+    
+    # Put factor matrices into single vector:
+    x0 = torch.cat([factor.reshape(1, -1).squeeze() for factor in prev_factors2])
+    
+    # Apply normal ALS step to x0 to obtain factors for iteration 2:
+    iter2_start_time = time.time()
+    curr_factors = ALS(tensor=tensor,factors=factors, rank=rank) 
+    iter2_time = (time.time() - iter2_start_time)
+    iter_times.append(iter2_time)
+    
+    # Put matrices in single vector:
+    x1 = torch.cat([factor.reshape(1, -1).squeeze() for factor in curr_factors])
+    
+    # Store errors:
+    errors = []
+    errors.append(test_func(x0,curr_factors))
+    errors.append(test_func(x1,curr_factors))
+    
+    start_time = time.time() # Start timing time to convergence
+    
+    # Run a further 4 iterations of normal ALS to stabilise the system before 
+    # computing gradients:
+    for i in range(4):
+        iter_start_time = time.time()
+        x0 = x1
+        x1 = ALS_vector(x0,curr_factors, tensor, rank)
+        errors.append(test_func(x1,curr_factors))
+        iter_time = (time.time() - iter_start_time)
+        iter_times.append(iter_time)
+        
+    iter_start_time = time.time()
+    x2 = ALS_vector(x1,curr_factors,tensor,rank)
+    errors.append(test_func(x2,curr_factors))
+    iter_time = (time.time() - iter_start_time)
+    iter_times.append(iter_time)
+    
+    # Initialise numerator for ADADELTA update equation (see equation 14 in 
+    # ADADELTA paper by M. Zeiler):
+    Ex1 = rho*(x1-x0)**2 + (1-rho)*(x2-x1)**2
+    RMS1 = (Ex1 + epsilon).sqrt()
+    
+    # Initialise term used in denominator of ADADELTA update equation:
+    Egt2 = test_grad(x1,curr_factors)**2
+    
+    norm_tensor = tl.norm(tensor, 2) # Compute the norm of the tensor for our stopping criterion
+    
+    start_time = time.time()
+    
+    for k in range(7, n_iter_max):
+            
+        iter_start_time = time.time()
+        
+        curr_error = errors[-1]
+        prev_error = errors[-2]
+        
+        # If restart condition met, set beta=0 for normal ALS step:
+        if curr_error>prev_error and len(beta) != 1:
+            x2 = x1
+            beta = 0
+        # Otherwise, set beta such that an ADEDELTA update is performed:
+        else:
+            beta = -RMS1/((Egt2 + epsilon).sqrt()) # ADADELTA weights
+        
+        start_from = x2 # Start point for next iteration
+        
+        
+        return_grad, y = test_grad2(x2, curr_factors)
+        acc_term = start_from + beta*return_grad
+        
+        #acc_term = start_from + beta*test_grad(x2, curr_factors) # Term to apply ALS to
+        x0 = x1 # Update x0 for next iter
+        x1 = x2 # Update x1 for next iter
+        x2 = ALS_vector(acc_term, curr_factors, tensor, rank) # Update x via ALS step
+    
+        errors.append(test_func(x2,curr_factors))
+    
+        # Update values used in ADADELTA update equation:
+        Ex1 = rho*(x1-x0)**2 + (1-rho)*(x2-x1)**2 # Used in numerator
+        RMS1 = (Ex1 + epsilon).sqrt() # Numerator
+        Egt2 = rho*Egt2 + (1-rho)*return_grad**2 
+        #Egt2 = rho*Egt2 + (1-rho)*test_grad(x1,curr_factors)**2 # Used in denominator
+        
+    
+        # If stopping criterion reached, then stop loop:
+        stopping = abs(errors[-1] - errors[-2])/norm_tensor # Compute the change in f, normalised
+        if stopping < tol:
+            break
+        
+        # Store iteration times:
+        iter_time = (time.time() - iter_start_time)
+        iter_times.append(iter_time)
+    
+    elapsed_time = (time.time() - start_time)     
+    
+    return elapsed_time, errors, curr_factors, iter_times, k
+
+
+
+
+def ALS_adam(tensor, rank, n_iter_max, random_state, tol, eta, beta1=0.9, beta2=0.999, epsilon=10e-8):
+    
+    """
+    
+    This function implements ALS with an ADAM update rule and function restarting. 
+    See Algorithm 1 in 'Adam: A method for stochastic optimization' by Kingma 
+    and Ba (2015) for details of the Adam updates. 
+    
+    One iteration of the function below invovles (i) updating the parameters 
+    as specified in Algorithm 1 in the above paper, and then (ii) applying 
+    an ALS step to these updated parameters to obtain the new factors. Ie 
+    part (i) can be viewed as extrapolation before the actual udpate. 
+    
+    Function restarting works as follows: if an update from x(t) to x(t+1) 
+    increases f, we set the parameters back to x(t) and do a normal ALS step, 
+    which guarantees a decrease in f. 
+    
+    Key Adam input parameter is learning rate eta. Paper recommends using 0.001. 
+    Other parameters beta1, beta2, and epsilon are set at the default values 
+    suggested in the paper. 
+    """
+    
+    
+    tl.set_backend('pytorch')
+    iter_times = []
+    
+    # Generate factor matrices for first iteration:    
+    iter1_start_time = time.time()
+    factors = initialize_factors(tensor, rank, init='random', svd='numpy_svd', random_state=random_state, non_negative=False) 
+    prev_factors2 = factors[:]
+    iter1_time = (time.time() - iter1_start_time)
+    iter_times.append(iter1_time)
+    
+    # Put factor matrices into single vector:
+    x0 = torch.cat([factor.reshape(1, -1).squeeze() for factor in prev_factors2])
+    
+    # Apply normal ALS step to x0 to obtain factors for iteration 2:
+    iter2_start_time = time.time()
+    curr_factors = ALS(tensor=tensor,factors=factors, rank=rank) 
+    iter2_time = (time.time() - iter2_start_time)
+    iter_times.append(iter2_time)
+    
+    # Put matrices in single vector:
+    x1 = torch.cat([factor.reshape(1, -1).squeeze() for factor in curr_factors])
+    
+    # Store errors:
+    errors = []
+    errors.append(test_func(x0,curr_factors))
+    errors.append(test_func(x1,curr_factors))
+    
+    start_time = time.time() # Start timing time to convergence
+    
+    # Run a further 5 iterations of normal ALS to stabilise the system before 
+    # computing gradient ratio weights (otherwise divergence is likely to occur:
+    for i in range(5):
+        iter_start_time = time.time()
+        x0 = x1
+        x1 = ALS_vector(x0,curr_factors, tensor, rank)
+        errors.append(test_func(x1,curr_factors))
+        iter_time = (time.time() - iter_start_time)
+        iter_times.append(iter_time)
+        
+    norm_tensor = tl.norm(tensor, 2) # Compute the norm of the tensor for our stopping criterion
+    
+    # Initialise terms for Adam:
+    m0 = 0
+    v0 = 0
+    
+    # Compute terms for Adam update equations:
+    t = 1 # Initialise t (used in Adam update equations)
+    gt, y = test_grad2(x1,curr_factors) # Get gradient and function value at x1
+    mt = beta1*m0 + (1-beta1)*gt
+    vt = beta2*v0 + (1-beta2)*gt**2
+    mthat = mt/(1-beta1**t)
+    vthat = vt/(1-beta2**t)
+    
+    norm_tensor = tl.norm(tensor, 2) # Compute the norm of the tensor for our stopping criterion
+    
+    start_time = time.time()
+    
+    for k in range(7, n_iter_max):
+            
+        iter_start_time = time.time()
+        
+        # Check for restart and set momentum weight:
+        curr_error = errors[-1]
+        prev_error = errors[-2]
+        
+        # If restart condition met, set beta=0 for normal ALS step:
+        if curr_error>prev_error and len(beta) != 1:
+            x1 = x0
+            beta = 0
+        # Otherwise, set beta as the Adam scaling factor:
+        else:
+            beta = -eta/(np.sqrt(vthat) + epsilon)
+            
+        start_from = x1 # Start point for update
+        
+        acc_term = start_from + beta*gt # Term to apply ALS to
+        x0 = x1 # Update x0 for the next iteration
+        x1 = ALS_vector(acc_term, curr_factors, tensor, rank) # Apply ALS step to obtain next iter's x
+    
+        # Compute updates for the Adam update equations:
+        t = k # Set iter counter
+        gt, y = test_grad2(x1,curr_factors)
+        errors.append(y) # Add the error for latest iter
+        mt = beta1*mt + (1-beta1)*gt
+        vt = beta2*vt + (1-beta2)*gt**2
+        mthat = mt/(1-beta1**t)
+        vthat = vt/(1-beta2**t)
+    
+        # If stopping criterion reached, then stop loop:
+        stopping = abs(errors[-1] - errors[-2])/norm_tensor # Compute the change in f, normalised
+        if stopping < tol:
+            break
+        
+        # Store iteration times:
+        iter_time = (time.time() - iter_start_time)
+        iter_times.append(iter_time)
+    
+    elapsed_time = (time.time() - start_time)     
+
+    return elapsed_time, errors, curr_factors, iter_times, k
+
+"""
+The functions below provide implementations of the main algorithms. These functions 
+are used to simplify the program for the experiments. Note that the parameters in the line
+search algorithm have only been optimized through heuristics and minor experimentation - 
+probably easy to find combinations that enhance performance a bit on our test problems. 
+"""
+
+
+def ALS_standard(tensor,rank,n_iter_max,random_state,tol):
+    elapsed_time, errors, curr_factors, iter_times, k = decomp(tensor=tensor, rank=rank, n_iter_max=n_iter_max, random_state=random_state, tol=tol,momentum_weight=0,inject_noise=0,mu=0,sig=0)
+    return elapsed_time, errors, curr_factors, iter_times, k
+
+def ALS_Nesterov_S1(tensor,rank,n_iter_max,random_state,tol):
+    elapsed_time, errors, curr_factors, iter_times, k = decomp(tensor=tensor, rank=rank, n_iter_max=n_iter_max, random_state=random_state, tol=tol,momentum_weight=1,inject_noise=0,mu=0,sig=0)
+    return elapsed_time, errors, curr_factors, iter_times, k
+
+def ALS_Nesterov_S1_noise(tensor,rank,n_iter_max,random_state,tol):
+    elapsed_time, errors, curr_factors, iter_times, k = decomp(tensor=tensor, rank=rank, n_iter_max=n_iter_max, random_state=random_state, tol=tol,momentum_weight=1,inject_noise=1,mu=0,sig=1)
+    return elapsed_time, errors, curr_factors, iter_times, k
+
+def ALS_Nesterov_backtracking_ls(tensor,rank,n_iter_max,random_state,tol):
+    elapsed_time, errors, curr_factors, iter_times, k = decomp_ls(tensor=tensor, rank=rank, n_iter_max=n_iter_max, random_state=random_state, tol=tol, ls_type='backtracking', alpha=1, c1=0.3, c2=0.7, deflator=0.5, max_ls_evaluations=2, accept_partial_search=True)
+    return elapsed_time, errors, curr_factors, iter_times, k
+
+def ALS_Nesterov_bisection_ls(tensor,rank,n_iter_max,random_state,tol):
+    elapsed_time, errors, curr_factors, iter_times, k = decomp_ls(tensor=tensor, rank=rank, n_iter_max=n_iter_max, random_state=random_state, tol=tol, ls_type='bisection', alpha=1, c1=0.3, c2=0.7, deflator=0.5, max_ls_evaluations=2, accept_partial_search=True)
+    return elapsed_time, errors, curr_factors, iter_times, k
+
+def ALS_momentum(tensor,rank,n_iter_max,random_state,tol):
+    elapsed_time, errors, curr_factors, iter_times, k = decomp_momentum(tensor=tensor, rank=rank, n_iter_max=n_iter_max, random_state=random_state, tol=tol, rho=0.3, momentum_weight=0.7)
+    return elapsed_time, errors, curr_factors, iter_times, k
+
+def ALS_S1_decay(tensor,rank,n_iter_max,random_state,tol):
+    elapsed_time, errors, curr_factors, iter_times, betas, k = decomp_fixed_weight(tensor=tensor, rank=rank, n_iter_max=n_iter_max, random_state=random_state, tol=tol, momentum_weight=1, memory=True, rho=0.1, inject_noise=False, tol2=10e-5)
+    return elapsed_time, errors, curr_factors, iter_times, k
+
+def ALS_S1_decay_noise(tensor,rank,n_iter_max,random_state,tol):
+    elapsed_time, errors, curr_factors, iter_times, betas, k = decomp_fixed_weight(tensor=tensor, rank=rank, n_iter_max=n_iter_max, random_state=random_state, tol=tol, momentum_weight=1, memory=True, rho=0.1, inject_noise=True, tol2=10e-5)
+    return elapsed_time, errors, curr_factors, iter_times, k
+
+def ALS_adadelta1(tensor,rank,n_iter_max,random_state,tol):
+    elapsed_time, errors, curr_factors, iter_times, k = ALS_adadelta(tensor=tensor, rank=rank, n_iter_max=n_iter_max, random_state=random_state, tol=tol, eta=0.001, epsilon=10e-8, rho=0.1)
+    return elapsed_time, errors, curr_factors, iter_times, k
+
+def ALS_adam1(tensor,rank,n_iter_max,random_state,tol):
+    elapsed_time, errors, curr_factors, iter_times, k = ALS_adam(tensor=tensor, rank=rank, n_iter_max=n_iter_max, random_state=random_state, tol=tol, eta=0.001, beta1=0.9, beta2=0.999, epsilon=10e-8)
+    return elapsed_time, errors, curr_factors, iter_times, k
